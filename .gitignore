@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+data/*.txt
+data/*.csv
+results/*.csv
+checkpoints/*
+!data/.gitkeep
+!results/.gitkeep
+!checkpoints/.gitkeep
