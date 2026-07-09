@@ -1,7 +1,6 @@
 """
 Data loading and preprocessing, generalized across the dataset registry
-in config.py. NSL-KDD is implemented now; additional datasets can be
-added as further loader functions following this same pattern.
+in config.py. NSL-KDD and CSE-CIC-IDS2018 are both implemented.
 """
 
 import os
@@ -11,55 +10,19 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder
 
 import config
 
-NSL_KDD_COLUMN_NAMES = [
-    "duration", "protocol_type", "service", "flag", "src_bytes", "dst_bytes",
-    "land", "wrong_fragment", "urgent", "hot", "num_failed_logins",
-    "logged_in", "num_compromised", "root_shell", "su_attempted",
-    "num_root", "num_file_creations", "num_shells", "num_access_files",
-    "num_outbound_cmds", "is_host_login", "is_guest_login", "count",
-    "srv_count", "serror_rate", "srv_serror_rate", "rerror_rate",
-    "srv_rerror_rate", "same_srv_rate", "diff_srv_rate",
-    "srv_diff_host_rate", "dst_host_count", "dst_host_srv_count",
-    "dst_host_same_srv_rate", "dst_host_diff_srv_rate",
-    "dst_host_same_src_port_rate", "dst_host_srv_diff_host_rate",
-    "dst_host_serror_rate", "dst_host_srv_serror_rate",
-    "dst_host_rerror_rate", "dst_host_srv_rerror_rate",
-    "label", "difficulty",
-]
-NSL_KDD_CATEGORICAL_COLS = ["protocol_type", "service", "flag"]
-
+# ---------------------------------------------------------------------------
+# Shared validation helpers (dataset-agnostic)
+# ---------------------------------------------------------------------------
 
 def _validate_row_count(df, expected, path, tolerance=0):
     actual = len(df)
     if expected is not None and abs(actual - expected) > tolerance:
         raise ValueError(
             f"Row count mismatch for {path}: expected {expected}, got "
-            f"{actual}. This means the file does not match the official "
-            f"dataset. Do not proceed, results from a mismatched file "
+            f"{actual}. This means the file does not match what was "
+            f"expected. Do not proceed, results from a mismatched file "
             f"are not trustworthy."
         )
-
-
-def _load_nsl_kdd_raw(path, expected_rows):
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Could not find {path}. Download the official NSL-KDD file "
-            f"and place it there before running anything."
-        )
-    df = pd.read_csv(path, header=None, names=NSL_KDD_COLUMN_NAMES)
-    _validate_row_count(df, expected_rows, path)
-    return df
-
-
-def _map_attack_category(label, attack_map):
-    label = label.strip().lower()
-    if label not in attack_map:
-        raise ValueError(
-            f"Unrecognized label '{label}' not in the attack map for this "
-            f"dataset. Do not silently drop this row, either the file is "
-            f"non-standard or the map needs an added entry."
-        )
-    return attack_map[label]
 
 
 def _check_category_completeness(y_train, y_test, expected_categories, split_name_pair):
@@ -91,20 +54,15 @@ def _check_no_nan_or_inf(X, array_name):
         n_bad = int(np.sum(~np.isfinite(X)))
         raise ValueError(
             f"{array_name} contains {n_bad} NaN or Inf values after "
-            f"preprocessing. Likely cause: a numeric column had zero "
-            f"variance in the training data, making StandardScaler "
-            f"divide by zero. Do not proceed with corrupted features, "
-            f"identify and handle the zero-variance column explicitly."
+            f"preprocessing. Do not proceed with corrupted features."
         )
 
 
 def _audit_train_test_overlap(train_features_df, test_features_df):
     """
     Reports how many exact-duplicate feature rows exist between train and
-    test. NSL-KDD was specifically created to fix KDD-99's duplicate-row
-    problem, this checks that rather than assuming it, and gives you an
-    honest, citable number for the Methods/Limitations section instead
-    of an unverified assumption.
+    test, an honest, citable number for the Methods/Limitations section
+    rather than an unverified assumption.
     """
     train_hashes = pd.util.hash_pandas_object(train_features_df, index=False)
     test_hashes = pd.util.hash_pandas_object(test_features_df, index=False)
@@ -119,24 +77,70 @@ def _audit_train_test_overlap(train_features_df, test_features_df):
     return overlap_count, overlap_fraction
 
 
-def load_and_preprocess(dataset_name="nsl_kdd"):
-    """
-    Loads and preprocesses the named dataset from the registry.
-    Fitting (encoder, scaler) is done on TRAIN ONLY and applied to test,
-    avoiding leakage.
+def audit_dataset(y_train, y_test, categories):
+    print("=== Train category distribution ===")
+    for cat in categories:
+        count = int((y_train == cat).sum())
+        print(f"  {cat}: {count}")
 
-    Returns:
-        X_train, y_train_category, X_test, y_test_category, feature_names
-    """
-    if dataset_name != "nsl_kdd":
-        raise NotImplementedError(
-            f"'{dataset_name}' is registered in config.DATASETS but its "
-            f"loader is not yet implemented. Only nsl_kdd is implemented. "
-            f"Add a loader following the NSL-KDD pattern before using "
-            f"this dataset."
+    print("=== Test category distribution ===")
+    for cat in categories:
+        count = int((y_test == cat).sum())
+        print(f"  {cat}: {count}")
+        if count < config.SMALL_CLASS_SUPPORT_THRESHOLD:
+            print(
+                f"    WARNING: '{cat}' has only {count} test instances "
+                f"(below the {config.SMALL_CLASS_SUPPORT_THRESHOLD}-instance "
+                f"threshold). Use Clopper-Pearson exact intervals for this "
+                f"class's recall, not naive bootstrap percentile intervals."
+            )
+
+
+# ---------------------------------------------------------------------------
+# NSL-KDD loader
+# ---------------------------------------------------------------------------
+
+NSL_KDD_COLUMN_NAMES = [
+    "duration", "protocol_type", "service", "flag", "src_bytes", "dst_bytes",
+    "land", "wrong_fragment", "urgent", "hot", "num_failed_logins",
+    "logged_in", "num_compromised", "root_shell", "su_attempted",
+    "num_root", "num_file_creations", "num_shells", "num_access_files",
+    "num_outbound_cmds", "is_host_login", "is_guest_login", "count",
+    "srv_count", "serror_rate", "srv_serror_rate", "rerror_rate",
+    "srv_rerror_rate", "same_srv_rate", "diff_srv_rate",
+    "srv_diff_host_rate", "dst_host_count", "dst_host_srv_count",
+    "dst_host_same_srv_rate", "dst_host_diff_srv_rate",
+    "dst_host_same_src_port_rate", "dst_host_srv_diff_host_rate",
+    "dst_host_serror_rate", "dst_host_srv_serror_rate",
+    "dst_host_rerror_rate", "dst_host_srv_rerror_rate",
+    "label", "difficulty",
+]
+NSL_KDD_CATEGORICAL_COLS = ["protocol_type", "service", "flag"]
+
+
+def _load_nsl_kdd_raw(path, expected_rows):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Could not find {path}. Download the official NSL-KDD file "
+            f"and place it there before running anything."
         )
+    df = pd.read_csv(path, header=None, names=NSL_KDD_COLUMN_NAMES)
+    _validate_row_count(df, expected_rows, path)
+    return df
 
-    ds_config = config.DATASETS[dataset_name]
+
+def _map_attack_category(label, attack_map):
+    label = label.strip().lower()
+    if label not in attack_map:
+        raise ValueError(
+            f"Unrecognized label '{label}' not in the attack map for this "
+            f"dataset. Do not silently drop this row, either the file is "
+            f"non-standard or the map needs an added entry."
+        )
+    return attack_map[label]
+
+
+def _load_and_preprocess_nsl_kdd(ds_config):
     train_df = _load_nsl_kdd_raw(ds_config["train_path"], ds_config["expected_train_rows"])
     test_df = _load_nsl_kdd_raw(ds_config["test_path"], ds_config["expected_test_rows"])
 
@@ -188,28 +192,127 @@ def load_and_preprocess(dataset_name="nsl_kdd"):
     return X_train, y_train, X_test, y_test, feature_names
 
 
-def audit_dataset(y_train, y_test, categories):
-    print("=== Train category distribution ===")
-    for cat in categories:
-        count = int((y_train == cat).sum())
-        print(f"  {cat}: {count}")
+# ---------------------------------------------------------------------------
+# CSE-CIC-IDS2018 loader
+# ---------------------------------------------------------------------------
 
-    print("=== Test category distribution ===")
-    for cat in categories:
-        count = int((y_test == cat).sum())
-        print(f"  {cat}: {count}")
-        if count < config.SMALL_CLASS_SUPPORT_THRESHOLD:
-            print(
-                f"    WARNING: '{cat}' has only {count} test instances "
-                f"(below the {config.SMALL_CLASS_SUPPORT_THRESHOLD}-instance "
-                f"threshold). Use Clopper-Pearson exact intervals for this "
-                f"class's recall, not naive bootstrap percentile intervals."
-            )
+def _load_cic_ids2018_prepared(path, expected_rows):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Could not find {path}. Run prepare_cicids2018.py first to "
+            f"generate this file from the raw downloaded data."
+        )
+    df = pd.read_csv(path)
+    _validate_row_count(df, expected_rows, path)
+    if "category" not in df.columns:
+        raise ValueError(
+            f"{path} has no 'category' column. This file should have been "
+            f"produced by prepare_cicids2018.py, which adds this column, "
+            f"if it's missing, this isn't the correct prepared file."
+        )
+    return df
+
+
+def _load_and_preprocess_cic_ids2018(ds_config):
+    train_df = _load_cic_ids2018_prepared(ds_config["train_path"], ds_config["expected_train_rows"])
+    test_df = _load_cic_ids2018_prepared(ds_config["test_path"], ds_config["expected_test_rows"])
+
+    expected_categories = ds_config["categories"]
+
+    y_train = train_df["category"].values
+    y_test = test_df["category"].values
+
+    _check_category_completeness(
+        y_train, y_test, expected_categories,
+        (ds_config["train_path"], ds_config["test_path"]),
+    )
+
+    train_features = train_df.drop(columns=["category"])
+    test_features = test_df.drop(columns=["category"])
+
+    if not set(train_features.columns) == set(test_features.columns):
+        raise ValueError(
+            f"Train and test feature columns don't match. Train has "
+            f"{set(train_features.columns) - set(test_features.columns)} "
+            f"extra, test has "
+            f"{set(test_features.columns) - set(train_features.columns)} "
+            f"extra. This means prepare_cicids2018.py produced "
+            f"inconsistent files, do not proceed."
+        )
+    test_features = test_features[train_features.columns]  # enforce same order
+
+    _audit_train_test_overlap(train_features, test_features)
+
+    # Independently re-verify all feature columns are actually numeric,
+    # rather than trusting prepare_cicids2018.py did this correctly.
+    # This file is a standalone safety layer, not a passthrough.
+    non_numeric_cols = [
+        c for c in train_features.columns
+        if not np.issubdtype(train_features[c].dtype, np.number)
+    ]
+    if non_numeric_cols:
+        raise ValueError(
+            f"Non-numeric feature columns found: {non_numeric_cols}. "
+            f"prepare_cicids2018.py should have coerced all features to "
+            f"numeric already, this means either that script has a gap "
+            f"or the wrong file is being read."
+        )
+
+    train_numeric = train_features.values.astype(np.float64)
+    test_numeric = test_features.values.astype(np.float64)
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(train_numeric)
+    X_test = scaler.transform(test_numeric)
+
+    _check_no_nan_or_inf(X_train, "X_train")
+    _check_no_nan_or_inf(X_test, "X_test")
+
+    feature_names = list(train_features.columns)
+
+    return X_train, y_train, X_test, y_test, feature_names
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+_LOADERS = {
+    "nsl_kdd": _load_and_preprocess_nsl_kdd,
+    "cse_cic_ids2018": _load_and_preprocess_cic_ids2018,
+}
+
+
+def load_and_preprocess(dataset_name="nsl_kdd"):
+    """
+    Loads and preprocesses the named dataset from the registry.
+    Fitting (scaler, and encoder where applicable) is done on TRAIN ONLY
+    and applied to test, avoiding leakage.
+
+    Returns:
+        X_train, y_train_category, X_test, y_test_category, feature_names
+    """
+    if dataset_name not in config.DATASETS:
+        raise ValueError(
+            f"'{dataset_name}' is not registered in config.DATASETS. "
+            f"Available: {list(config.DATASETS.keys())}"
+        )
+    if dataset_name not in _LOADERS:
+        raise NotImplementedError(
+            f"'{dataset_name}' is registered but has no loader implemented "
+            f"in data.py. Add one following the existing patterns."
+        )
+
+    ds_config = config.DATASETS[dataset_name]
+    loader = _LOADERS[dataset_name]
+    return loader(ds_config)
 
 
 if __name__ == "__main__":
-    X_train, y_train, X_test, y_test, feature_names = load_and_preprocess("nsl_kdd")
+    import sys
+    dataset_name = sys.argv[1] if len(sys.argv) > 1 else "nsl_kdd"
+    X_train, y_train, X_test, y_test, feature_names = load_and_preprocess(dataset_name)
     print(f"X_train shape: {X_train.shape}")
     print(f"X_test shape: {X_test.shape}")
-    print(f"Number of features after encoding: {len(feature_names)}")
-    audit_dataset(y_train, y_test, config.ATTACK_CATEGORIES)
+    print(f"Number of features: {len(feature_names)}")
+    audit_dataset(y_train, y_test, config.DATASETS[dataset_name]["categories"])

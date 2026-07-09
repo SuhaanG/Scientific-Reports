@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 data/*.txt
 data/*.csv
+data/cicids2018_raw/
 results/*.csv
 checkpoints/*
 environment_logs/*.json
