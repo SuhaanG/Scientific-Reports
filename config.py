@@ -1,12 +1,12 @@
 """
-Configuration for the IDS seed-variance pilot study.
+Configuration for the IDS seed-variance study.
 
 PRE-REGISTRATION NOTE:
-These parameters (seed count, architecture, hyperparameters) should be
-locked before running the pilot and not changed after seeing results.
-If you change something here after looking at pilot output, document why
-in your lab notebook / commit message, since silent changes undermine the
-pre-registration argument in the paper.
+These parameters are locked before running any experiment stage and
+should not change after seeing results. If a parameter genuinely must
+change after the pilot, document why and when in a dated commit message,
+undocumented post-hoc changes undermine the pre-registration argument in
+the paper's Methods section.
 """
 
 import os
@@ -18,45 +18,40 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
-
-NSL_KDD_TRAIN_PATH = os.path.join(DATA_DIR, "KDDTrain+.txt")
-NSL_KDD_TEST_PATH = os.path.join(DATA_DIR, "KDDTest+.txt")
+ENV_LOG_DIR = os.path.join(PROJECT_ROOT, "environment_logs")
 
 # ---------------------------------------------------------------------------
-# Pilot experiment parameters (Stage 1: NSL-KDD only, one architecture)
+# Results schema version
 # ---------------------------------------------------------------------------
-PILOT_SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # 10 seeds for the pilot
+# Bump this any time the CSV column structure in train.py changes. Stamped
+# into every environment log so pilot-stage and full-stage result files
+# can never be silently mixed during analysis if the schema diverged
+# between them.
+RESULTS_SCHEMA_VERSION = "1.0"
 
-# Full-scale seeds (only use after the pilot passes the go/no-go check)
-FULL_SEEDS = list(range(40))  # 40 seeds, adjust after confirming compute budget
+# ---------------------------------------------------------------------------
+# Seed configuration
+# ---------------------------------------------------------------------------
+PILOT_SEEDS = list(range(10))
+FULL_SEEDS = list(range(40))
 
-# Architecture hyperparameters for the feedforward DNN (Stage 1 architecture)
-DNN_HIDDEN_SIZES = [128, 64, 32]
-DNN_DROPOUT = 0.2
-DNN_LEARNING_RATE = 1e-3
-DNN_BATCH_SIZE = 256
-DNN_EPOCHS = 50
-DNN_EARLY_STOP_PATIENCE = 5
+BOOTSTRAP_RNG_SEED = 999_999  # deliberately separate from training seeds
 
-# Attack category mapping for NSL-KDD (41 features + label + difficulty)
-# Maps the ~39 fine-grained attack labels to the 4 standard coarse categories
-# used throughout the IDS literature (DoS, Probe, R2L, U2R) plus 'normal'.
+# ---------------------------------------------------------------------------
+# Dataset registry
+# ---------------------------------------------------------------------------
 NSL_KDD_ATTACK_MAP = {
     "normal": "normal",
-    # DoS
     "back": "dos", "land": "dos", "neptune": "dos", "pod": "dos",
     "smurf": "dos", "teardrop": "dos", "apache2": "dos", "udpstorm": "dos",
     "processtable": "dos", "mailbomb": "dos",
-    # Probe
     "ipsweep": "probe", "nmap": "probe", "portsweep": "probe",
     "satan": "probe", "mscan": "probe", "saint": "probe",
-    # R2L (Remote to Local)
     "ftp_write": "r2l", "guess_passwd": "r2l", "imap": "r2l",
     "multihop": "r2l", "phf": "r2l", "spy": "r2l", "warezclient": "r2l",
     "warezmaster": "r2l", "sendmail": "r2l", "named": "r2l",
     "snmpgetattack": "r2l", "snmpguess": "r2l", "xlock": "r2l",
     "xsnoop": "r2l", "worm": "r2l",
-    # U2R (User to Root)
     "buffer_overflow": "u2r", "loadmodule": "u2r", "perl": "u2r",
     "rootkit": "u2r", "httptunnel": "u2r", "ps": "u2r",
     "sqlattack": "u2r", "xterm": "u2r",
@@ -64,12 +59,51 @@ NSL_KDD_ATTACK_MAP = {
 
 ATTACK_CATEGORIES = ["normal", "dos", "probe", "r2l", "u2r"]
 
+DATASETS = {
+    "nsl_kdd": {
+        "train_path": os.path.join(DATA_DIR, "KDDTrain+.txt"),
+        "test_path": os.path.join(DATA_DIR, "KDDTest+.txt"),
+        "attack_map": NSL_KDD_ATTACK_MAP,
+        "categories": ATTACK_CATEGORIES,
+        "expected_train_rows": 125973,
+        "expected_test_rows": 22544,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Architecture hyperparameters
+# ---------------------------------------------------------------------------
+ARCHITECTURES = ["dnn", "random_forest", "xgboost"]
+
+DNN_HIDDEN_SIZES = [128, 64, 32]
+DNN_DROPOUT = 0.2
+DNN_LEARNING_RATE = 1e-3
+DNN_BATCH_SIZE = 256
+DNN_MAX_EPOCHS = 50
+DNN_EARLY_STOP_PATIENCE = 5
+DNN_VALIDATION_FRACTION = 0.15
+
+RF_N_ESTIMATORS = 200
+RF_MAX_DEPTH = None
+
+XGB_N_ESTIMATORS = 200
+XGB_MAX_DEPTH = 6
+XGB_LEARNING_RATE = 0.1
+# subsample/colsample MUST be < 1.0, otherwise random_state has nothing to
+# actually randomize (every boosting round would deterministically use all
+# rows and all features regardless of seed), which was caught by an
+# explicit same-seed-vs-different-seed determinism test during development.
+XGB_SUBSAMPLE = 0.8
+XGB_COLSAMPLE_BYTREE = 0.8
+
 # ---------------------------------------------------------------------------
 # Statistical analysis parameters
 # ---------------------------------------------------------------------------
 BOOTSTRAP_ITERATIONS = 5000
 CONFIDENCE_LEVEL = 0.95
-SEED_SUBSET_CHECKPOINTS = [3, 5, 10, 20, 30, 40]  # for the seed-adequacy analysis
+SEED_SUBSET_CHECKPOINTS = [3, 5, 10, 20, 30, 40]
+MULTIPLE_COMPARISON_METHOD = "fdr_bh"
+SMALL_CLASS_SUPPORT_THRESHOLD = 500
 
-RANDOM_STATE_FOR_SPLIT = 42  # only used if we need a fixed reference split;
-                             # NOT used as a model training seed
+RANDOM_STATE_FOR_SPLIT = 42  # fixed validation-split reference seed only,
+                              # never used as a model training seed

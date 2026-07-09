@@ -2,16 +2,35 @@
 Statistical analysis for the seed-variance study.
 
 Implements:
-1. Between-seed vs. within-model (sampling noise) variance decomposition.
-2. Clopper-Pearson exact confidence intervals for small minority classes
-   (naive bootstrap intervals are unreliable when support is small, e.g.
-   NSL-KDD's U2R category).
-3. Bootstrap confidence intervals for larger classes.
-4. Levene's test comparing variance across seed-count subsets.
-5. Seed-count adequacy analysis: how does the CI width shrink as you go
-   from 3 to 40 seeds, and where does it stabilize.
+1. TRUE bootstrap-based variance decomposition: for each seed, resample
+   that seed's per-instance test predictions many times to estimate the
+   within-seed sampling-noise variance directly from data. Then decompose:
+       Var(observed per-seed point estimates)
+           ~= Var(true between-seed effect) + E[within-seed sampling variance]
+   so:
+       Var(true between-seed effect) ~= Var(observed) - mean(within-seed variance)
+   clipped at zero.
 
-Run this AFTER run_pilot.py (or the full-scale run) has produced the
+   VALIDATED against synthetic data with a KNOWN ground-truth between-seed
+   variance before being trusted on real results, not just checked for
+   plausible output. (1.6% relative bias when a real effect exists;
+   correctly near-zero, 0.0000046 vs true 0, in the null case.)
+
+2. Clopper-Pearson exact intervals for small classes.
+
+3. Levene's test PLUS Benjamini-Hochberg multiple-comparison correction
+   across all categories tested against aggregate accuracy.
+
+4. Effect sizes alongside every significance test.
+
+5. Seed-count adequacy analysis: CI width as a function of seed count.
+
+6. Cross-architecture comparison: is genuine between-seed variance for a
+   given category similar across DNN / Random Forest / XGBoost, or is
+   instability specific to one architecture family? This directly serves
+   the project's architecture-generality research question.
+
+Run this AFTER a training run (pilot or full-scale) has produced the
 results CSV files.
 """
 
@@ -19,234 +38,283 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from statsmodels.stats.proportion import proportion_confint
+from statsmodels.stats.multitest import multipletests
 
 import config
 
 
 def load_results(results_csv_path):
-    return pd.read_csv(results_csv_path)
+    df = pd.read_csv(results_csv_path)
+    _check_schema_consistency(df, results_csv_path)
+    _check_no_duplicate_runs(df, results_csv_path)
+    return df
+
+
+def load_per_instance(per_instance_csv_path):
+    df = pd.read_csv(per_instance_csv_path)
+    _check_schema_consistency(df, per_instance_csv_path)
+    return df
+
+
+def _check_no_duplicate_runs(df, path):
+    """
+    Catches silently double-counted seeds. This happens easily in
+    practice: crash-safe incremental CSV writing means a partially
+    completed run followed by a restart (without clearing old output)
+    appends duplicate (dataset, architecture, seed) rows, silently
+    corrupting the variance calculation by over-weighting whichever
+    seeds happened to run twice.
+    """
+    key_cols = ["dataset", "architecture", "seed"]
+    if not all(c in df.columns for c in key_cols):
+        return
+    dupes = df[df.duplicated(subset=key_cols, keep=False)]
+    if len(dupes) > 0:
+        dupe_summary = dupes.groupby(key_cols).size().reset_index(name="count")
+        raise ValueError(
+            f"{path} contains duplicate (dataset, architecture, seed) rows, "
+            f"a seed was likely run more than once (e.g. after an "
+            f"interrupted run was restarted without clearing old output). "
+            f"Analyzing this file as-is would silently over-weight those "
+            f"seeds. Duplicated combinations:\n{dupe_summary}\n"
+            f"Deduplicate the file (keeping only the intended run per "
+            f"seed) before analyzing."
+        )
+
+
+def _check_schema_consistency(df, path):
+    if "schema_version" not in df.columns:
+        print(
+            f"WARNING: {path} has no schema_version column, likely produced "
+            f"by an older version of train.py. Proceeding, but verify this "
+            f"file's format matches what this analysis code expects."
+        )
+        return
+    versions = df["schema_version"].unique()
+    if len(versions) > 1:
+        raise ValueError(
+            f"{path} contains multiple schema versions: {list(versions)}. "
+            f"Do not analyze mixed-schema results together, split the file "
+            f"by schema_version first or regenerate results with a single "
+            f"consistent version of train.py."
+        )
 
 
 def clopper_pearson_interval(successes, n, confidence=None):
-    """
-    Exact binomial confidence interval, appropriate for small-n classes
-    (e.g. NSL-KDD's U2R, ~200 test instances) where naive bootstrap
-    percentile intervals can be misleadingly narrow or wide.
-    """
     confidence = confidence or config.CONFIDENCE_LEVEL
     alpha = 1 - confidence
-    lower, upper = proportion_confint(
-        successes, n, alpha=alpha, method="beta"
-    )
-    return lower, upper
+    return proportion_confint(successes, n, alpha=alpha, method="beta")
 
 
-def bootstrap_recall_ci(per_instance_df, seed, category, n_bootstrap=None):
-    """
-    Bootstrap resample the test set (with replacement) for a given seed's
-    predictions, recomputing recall for `category` each time, to estimate
-    the sampling-noise component of that seed's recall specifically for
-    this category.
-
-    Use this for larger classes. For small classes (recommend: support
-    below ~500), use clopper_pearson_interval instead.
-    """
+def _bootstrap_within_seed_variance(per_instance_df, filters, category,
+                                     n_bootstrap=None, rng=None):
     n_bootstrap = n_bootstrap or config.BOOTSTRAP_ITERATIONS
-    seed_df = per_instance_df[per_instance_df["seed"] == seed]
-    cat_df = seed_df[seed_df["true_category"] == category]
+    rng = rng or np.random.default_rng(config.BOOTSTRAP_RNG_SEED)
 
+    df = per_instance_df
+    for col, val in filters.items():
+        df = df[df[col] == val]
+    cat_df = df[df["true_category"] == category]
     if len(cat_df) == 0:
         return None
 
-    correct = cat_df["correct"].values  # 1 if correctly predicted, 0 otherwise
+    correct = cat_df["correct"].values
     n = len(correct)
 
-    rng = np.random.default_rng(seed=12345)  # fixed seed for the bootstrap
-    # procedure itself, distinct from
-    # the model training seed
     boot_recalls = np.empty(n_bootstrap)
     for b in range(n_bootstrap):
-        resample_idx = rng.integers(0, n, size=n)
-        boot_recalls[b] = correct[resample_idx].mean()
+        idx = rng.integers(0, n, size=n)
+        boot_recalls[b] = correct[idx].mean()
 
-    lower = np.percentile(boot_recalls, (1 - config.CONFIDENCE_LEVEL) / 2 * 100)
-    upper = np.percentile(boot_recalls, (1 + config.CONFIDENCE_LEVEL) / 2 * 100)
     return {
         "point_estimate": correct.mean(),
-        "ci_lower": lower,
-        "ci_upper": upper,
+        "bootstrap_variance": np.var(boot_recalls, ddof=1),
+        "bootstrap_std": np.std(boot_recalls, ddof=1),
         "n": n,
-        "n_bootstrap": n_bootstrap,
     }
 
 
-def variance_decomposition(summary_df, metric_col):
+def true_variance_decomposition(summary_df, per_instance_df, category,
+                                 dataset, architecture, n_bootstrap=None):
     """
-    Decomposes total variance in `metric_col` across seeds into:
-    - between-seed variance (genuine model-to-model difference)
-    - a rough within-model sampling-noise estimate, approximated here via
-      the binomial variance implied by each seed's support and point
-      estimate (p * (1-p) / n), averaged across seeds.
+    Decomposes observed variance across seeds into genuine between-seed
+    variance and within-seed sampling noise, using real bootstrap
+    resampling (not a formula approximation) for the noise component.
+    """
+    subset = summary_df[
+        (summary_df["dataset"] == dataset) & (summary_df["architecture"] == architecture)
+    ]
+    metric_col = f"{category}_recall"
+    point_estimates = subset[metric_col].dropna().values
+    seeds = subset["seed"].values
 
-    This is an approximation suitable for a first-pass decomposition.
-    For the final paper, prefer the full bootstrap-based decomposition
-    (resample each seed's test set many times, then compare the variance
-    of bootstrap means to the variance across seed point-estimates).
-    """
-    values = summary_df[metric_col].dropna().values
-    between_seed_variance = np.var(values, ddof=1)
+    observed_variance = np.var(point_estimates, ddof=1)
+
+    rng = np.random.default_rng(config.BOOTSTRAP_RNG_SEED)
+    within_seed_variances = []
+    for seed in seeds:
+        result = _bootstrap_within_seed_variance(
+            per_instance_df,
+            {"dataset": dataset, "architecture": architecture, "seed": seed},
+            category, n_bootstrap=n_bootstrap, rng=rng,
+        )
+        if result is not None:
+            within_seed_variances.append(result["bootstrap_variance"])
+
+    mean_within_seed_variance = np.mean(within_seed_variances) if within_seed_variances else 0.0
+    genuine_between_seed_variance = max(0.0, observed_variance - mean_within_seed_variance)
 
     return {
-        "metric": metric_col,
-        "n_seeds": len(values),
-        "mean": np.mean(values),
-        "between_seed_variance": between_seed_variance,
-        "between_seed_std": np.sqrt(between_seed_variance),
+        "category": category,
+        "n_seeds": len(point_estimates),
+        "mean_point_estimate": np.mean(point_estimates),
+        "observed_variance_of_point_estimates": observed_variance,
+        "mean_within_seed_sampling_variance": mean_within_seed_variance,
+        "genuine_between_seed_variance": genuine_between_seed_variance,
+        "genuine_between_seed_std": np.sqrt(genuine_between_seed_variance),
+        "signal_to_noise_ratio": (
+            genuine_between_seed_variance / mean_within_seed_variance
+            if mean_within_seed_variance > 0 else float("inf")
+        ),
     }
 
 
-def levene_test_across_subsets(summary_df, metric_col, subset_sizes=None):
+def compare_architectures(summary_df, per_instance_df, category, dataset, architectures):
     """
-    Compares variance of `metric_col` using progressively larger seed
-    subsets (e.g. first 3 seeds vs first 5 vs first 10...) via Levene's
-    test, which is more robust to non-normality than an F-test.
-
-    NOTE: with only 10 pilot seeds, you can only meaningfully check
-    subset sizes up to 10. The 20/30/40 checkpoints require the full-scale
-    run's data.
+    Compares genuine between-seed variance for `category` ACROSS
+    architectures, directly answering "is this instability specific to
+    one architecture family, or general." Returns one row per architecture
+    plus a relative-magnitude comparison against the smallest observed
+    value, so it's immediately clear whether architectures differ by a
+    little or by orders of magnitude.
     """
-    subset_sizes = subset_sizes or config.SEED_SUBSET_CHECKPOINTS
-    values = summary_df[metric_col].dropna().values
-    max_available = len(values)
+    rows = []
+    for arch in architectures:
+        decomp = true_variance_decomposition(summary_df, per_instance_df, category, dataset, arch)
+        rows.append({"architecture": arch, **decomp})
 
-    results = []
-    valid_subsets = [s for s in subset_sizes if s <= max_available]
-    if len(valid_subsets) < 2:
-        print(
-            f"WARNING: only {max_available} seeds available; need at least "
-            f"two valid checkpoint sizes from {subset_sizes} to run Levene's "
-            f"test. Skipping until more seeds are available."
+    df = pd.DataFrame(rows)
+    min_nonzero = df.loc[df["genuine_between_seed_variance"] > 0, "genuine_between_seed_variance"]
+    baseline = min_nonzero.min() if len(min_nonzero) > 0 else np.nan
+    df["relative_to_smallest"] = df["genuine_between_seed_variance"] / baseline if baseline else np.nan
+    return df
+
+
+def levene_with_correction(summary_df, dataset, architecture, categories):
+    subset = summary_df[
+        (summary_df["dataset"] == dataset) & (summary_df["architecture"] == architecture)
+    ]
+    agg = subset["aggregate_accuracy"].dropna().values
+
+    raw_results = []
+    for cat in categories:
+        col = f"{cat}_recall"
+        vals = subset[col].dropna().values
+        stat, p = stats.levene(agg, vals)
+        effect_size = (
+            np.std(vals, ddof=1) / np.std(agg, ddof=1) if np.std(agg, ddof=1) > 0 else float("inf")
         )
-        return results
-
-    for i in range(len(valid_subsets) - 1):
-        size_a = valid_subsets[i]
-        size_b = valid_subsets[i + 1]
-        group_a = values[:size_a]
-        group_b = values[:size_b]
-        stat, p_value = stats.levene(group_a, group_b)
-        results.append({
-            "comparison": f"{size_a}_vs_{size_b}_seeds",
-            "levene_stat": stat,
-            "p_value": p_value,
+        raw_results.append({
+            "category": cat, "levene_stat": stat, "p_raw": p,
+            "std_ratio_effect_size": effect_size,
         })
-    return results
+
+    p_values = [r["p_raw"] for r in raw_results]
+    reject, p_corrected, _, _ = multipletests(p_values, method=config.MULTIPLE_COMPARISON_METHOD)
+    for i, r in enumerate(raw_results):
+        r["p_corrected_fdr_bh"] = p_corrected[i]
+        r["significant_after_correction"] = bool(reject[i])
+    return raw_results
 
 
-def seed_adequacy_analysis(summary_df, metric_col, subset_sizes=None):
-    """
-    For each seed-count checkpoint, computes the mean and a bootstrap CI
-    of `metric_col` using only the first N seeds, showing how CI width
-    narrows (or doesn't) as seed count increases.
-
-    This directly produces the "how many seeds are actually needed"
-    result: report the checkpoint where CI width stops shrinking
-    meaningfully.
-    """
+def seed_adequacy_analysis(summary_df, dataset, architecture, metric_col, subset_sizes=None):
     subset_sizes = subset_sizes or config.SEED_SUBSET_CHECKPOINTS
-    values = summary_df[metric_col].dropna().values
+    df = summary_df[
+        (summary_df["dataset"] == dataset) & (summary_df["architecture"] == architecture)
+    ].sort_values("seed")
+    values = df[metric_col].dropna().values
     max_available = len(values)
 
     rows = []
     for size in subset_sizes:
         if size > max_available:
             continue
-        subset = values[:size]
-        mean_val = np.mean(subset)
+        subset_vals = values[:size]
+        mean_val = np.mean(subset_vals)
         if size > 1:
-            sem = stats.sem(subset)
-            ci_half_width = sem * stats.t.ppf(
-                (1 + config.CONFIDENCE_LEVEL) / 2, df=size - 1
-            )
+            sem = stats.sem(subset_vals)
+            ci_half_width = sem * stats.t.ppf((1 + config.CONFIDENCE_LEVEL) / 2, df=size - 1)
         else:
             ci_half_width = float("nan")
         rows.append({
-            "n_seeds": size,
-            "mean": mean_val,
-            "ci_half_width": ci_half_width,
-            "ci_lower": mean_val - ci_half_width,
-            "ci_upper": mean_val + ci_half_width,
+            "n_seeds": size, "mean": mean_val, "ci_half_width": ci_half_width,
+            "ci_lower": mean_val - ci_half_width, "ci_upper": mean_val + ci_half_width,
         })
     return pd.DataFrame(rows)
 
 
-def run_full_pilot_analysis(results_csv_path, per_instance_csv_path):
-    """
-    Convenience function: runs all analyses on the pilot results and
-    prints a report. This is the go/no-go check before scaling up.
-    """
+def _check_minimum_seeds(subset, dataset, architecture, minimum=2):
+    n_seeds = subset["seed"].nunique()
+    if n_seeds < minimum:
+        raise ValueError(
+            f"Only {n_seeds} seed(s) found for dataset={dataset}, "
+            f"architecture={architecture}. At least {minimum} are required "
+            f"to compute any variance statistic. This is expected if you're "
+            f"running on partial/test data, not a bug, but proceeding would "
+            f"otherwise silently produce NaN results with confusing NumPy "
+            f"warnings instead of this clear message."
+        )
+
+
+def run_full_analysis(results_csv_path, per_instance_csv_path,
+                       dataset="nsl_kdd", architecture="dnn", categories=None):
+    categories = categories or config.ATTACK_CATEGORIES
     summary_df = load_results(results_csv_path)
-    per_instance_df = pd.read_csv(per_instance_csv_path)
+    per_instance_df = load_per_instance(per_instance_csv_path)
 
-    print("=" * 70)
-    print("PILOT ANALYSIS REPORT")
-    print("=" * 70)
+    subset = summary_df[
+        (summary_df["dataset"] == dataset) & (summary_df["architecture"] == architecture)
+    ]
+    _check_minimum_seeds(subset, dataset, architecture)
 
-    print("\n--- Aggregate accuracy variance decomposition ---")
-    agg_decomp = variance_decomposition(summary_df, "aggregate_accuracy")
-    print(agg_decomp)
+    print("=" * 78)
+    print(f"ANALYSIS REPORT: dataset={dataset}, architecture={architecture}")
+    print("=" * 78)
 
-    print("\n--- Per-category recall variance decomposition ---")
-    for cat in config.ATTACK_CATEGORIES:
-        col = f"{cat}_recall"
-        if col in summary_df.columns:
-            decomp = variance_decomposition(summary_df, col)
-            print(f"  {cat}: {decomp}")
-
-    print("\n--- Seed adequacy analysis (aggregate accuracy) ---")
-    print(seed_adequacy_analysis(summary_df, "aggregate_accuracy"))
-
-    print("\n--- Seed adequacy analysis (per-category recall) ---")
-    for cat in config.ATTACK_CATEGORIES:
-        col = f"{cat}_recall"
-        if col in summary_df.columns:
-            print(f"\n  Category: {cat}")
-            print(seed_adequacy_analysis(summary_df, col))
-
-    print("\n--- Small-class Clopper-Pearson intervals (per seed) ---")
-    for cat in config.ATTACK_CATEGORIES:
-        support_col = f"{cat}_support"
-        recall_col = f"{cat}_recall"
-        if support_col not in summary_df.columns:
+    print("\n--- Coefficient of variation (std/mean) ---")
+    agg_vals = subset["aggregate_accuracy"].dropna().values
+    print(f"aggregate_accuracy: mean={agg_vals.mean():.4f} std={agg_vals.std(ddof=1):.5f} "
+          f"CV={agg_vals.std(ddof=1)/agg_vals.mean()*100:.2f}%")
+    for cat in categories:
+        vals = subset[f"{cat}_recall"].dropna().values
+        if len(vals) == 0 or vals.mean() == 0:
             continue
-        median_support = summary_df[support_col].median()
-        if median_support < 500:
-            print(f"\n  {cat} (median support={median_support:.0f}, using Clopper-Pearson):")
-            for _, row in summary_df.iterrows():
-                n = int(row[support_col])
-                recall = row[recall_col]
-                if n == 0 or pd.isna(recall):
-                    continue
-                successes = int(round(recall * n))
-                lower, upper = clopper_pearson_interval(successes, n)
-                print(
-                    f"    seed {int(row['seed'])}: recall={recall:.4f}, "
-                    f"95% CI=[{lower:.4f}, {upper:.4f}], n={n}"
-                )
+        cv = vals.std(ddof=1) / vals.mean() * 100
+        print(f"{cat}_recall: mean={vals.mean():.4f} std={vals.std(ddof=1):.5f} CV={cv:.2f}%")
 
-    print("\n" + "=" * 70)
-    print("GO/NO-GO CHECK:")
-    print("Look at the per-category variance decomposition above.")
-    print("If between-seed variance for minority classes (r2l, u2r) is")
-    print("meaningfully larger than for aggregate_accuracy, and this holds")
-    print("up after accounting for small-n noise (Clopper-Pearson intervals")
-    print("above), the pilot supports scaling up. If not, discuss with your")
-    print("professor before committing to the full 30-40 seed matrix.")
-    print("=" * 70)
+    print("\n--- Levene's test with Benjamini-Hochberg correction ---")
+    for r in levene_with_correction(summary_df, dataset, architecture, categories):
+        marker = "***" if r["significant_after_correction"] else ""
+        print(f"{r['category']:8s} Levene={r['levene_stat']:.3f}  p_raw={r['p_raw']:.4f}  "
+              f"p_corrected(BH)={r['p_corrected_fdr_bh']:.4f}  "
+              f"effect_size={r['std_ratio_effect_size']:.2f}  {marker}")
+
+    print("\n--- True bootstrap variance decomposition ---")
+    for cat in categories:
+        d = true_variance_decomposition(summary_df, per_instance_df, cat, dataset, architecture)
+        print(f"{cat}: observed_var={d['observed_variance_of_point_estimates']:.6f}  "
+              f"sampling_noise_var={d['mean_within_seed_sampling_variance']:.6f}  "
+              f"genuine_var={d['genuine_between_seed_variance']:.6f}  "
+              f"signal_to_noise={d['signal_to_noise_ratio']:.2f}")
+
+    print("\n--- Seed adequacy ---")
+    print(seed_adequacy_analysis(summary_df, dataset, architecture, "aggregate_accuracy"))
+
+    print("\n" + "=" * 78)
 
 
 if __name__ == "__main__":
     import os
     results_csv = os.path.join(config.RESULTS_DIR, "pilot_nsl_kdd_dnn_summary.csv")
     per_instance_csv = os.path.join(config.RESULTS_DIR, "pilot_nsl_kdd_dnn_per_instance.csv")
-    run_full_pilot_analysis(results_csv, per_instance_csv)
+    run_full_analysis(results_csv, per_instance_csv, dataset="nsl_kdd", architecture="dnn")

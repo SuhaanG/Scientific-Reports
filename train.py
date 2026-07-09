@@ -1,27 +1,29 @@
 """
-Trains and evaluates the IDS classifier for a single random seed.
+Trains and evaluates a single (architecture, seed) combination on a given
+dataset, computing aggregate and per-attack-category metrics.
 
-Design notes:
-- Results are appended to a CSV file immediately after each seed finishes,
-  not held in memory and written at the end. If a job crashes at seed 7 of
-  10, you keep seeds 0-6's results rather than losing everything.
-- Per-attack-category metrics (not just aggregate accuracy) are computed
-  and saved for every seed, since the per-category breakdown is the core
-  measurement this whole project is built around.
+Design principles:
+- Results are appended to CSV immediately after each run, not held in
+  memory, so a crash partway through a long matrix doesn't lose completed
+  runs.
+- Per-instance predictions are also saved, needed for bootstrap resampling.
+- Every RNG is reseeded before each run, for all three architectures.
+- A failed run raises loudly with full context (dataset, architecture,
+  seed) rather than being silently caught and skipped, a silently missing
+  seed in a 40-row results file is easy to miss and would corrupt the
+  variance analysis without any visible sign.
+- schema_version is written into every results row, not just the
+  environment log, so a schema mismatch is visible directly in the data.
 """
 
 import os
 import csv
 import time
+import random
 import numpy as np
-import torch
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.metrics import confusion_matrix
 
 import config
-from model import IDSClassifier, set_full_determinism
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from model import build_model, set_full_determinism
 
 
 def _category_to_index(categories):
@@ -29,14 +31,6 @@ def _category_to_index(categories):
 
 
 def compute_per_category_metrics(y_true, y_pred, categories):
-    """
-    Returns a dict: {category: {'recall': ..., 'precision': ..., 'support': ...,
-    'false_negatives': ..., 'true_positives': ...}}
-
-    Recall here is computed one-vs-rest per category, which is what you
-    need for the "does the model miss this specific attack type" question,
-    not a multi-class macro-average that hides category-level detail.
-    """
     cat_to_idx = _category_to_index(categories)
     y_true_idx = np.array([cat_to_idx[c] for c in y_true])
     y_pred_idx = np.array([cat_to_idx[c] for c in y_pred])
@@ -44,7 +38,6 @@ def compute_per_category_metrics(y_true, y_pred, categories):
     results = {}
     for cat, idx in cat_to_idx.items():
         true_positive = int(np.sum((y_true_idx == idx) & (y_pred_idx == idx)))
-        false_negative = int(np.sum((y_true_idx == idx) & (y_pred_idx != idx)))
         false_positive = int(np.sum((y_true_idx != idx) & (y_pred_idx == idx)))
         support = int(np.sum(y_true_idx == idx))
 
@@ -52,105 +45,80 @@ def compute_per_category_metrics(y_true, y_pred, categories):
         denom = true_positive + false_positive
         precision = true_positive / denom if denom > 0 else float("nan")
 
-        results[cat] = {
-            "recall": recall,
-            "precision": precision,
-            "support": support,
-            "true_positives": true_positive,
-            "false_negatives": false_negative,
-        }
+        results[cat] = {"recall": recall, "precision": precision, "support": support}
     return results
 
 
-def train_one_seed(seed, X_train, y_train, X_test, y_test, categories,
-                    results_csv_path, per_instance_csv_path):
+def train_one_run(architecture, seed, X_train, y_train, X_test, y_test,
+                   categories, results_csv_path, per_instance_csv_path,
+                   dataset_name):
     """
-    Trains the DNN for one seed, evaluates on the test set, appends
-    aggregate + per-category metrics to results_csv_path, and appends
-    per-instance predictions to per_instance_csv_path (needed later for
-    bootstrap resampling of the test set).
+    Trains and evaluates ONE (architecture, seed) combination.
+    Appends a summary row and per-instance predictions to their
+    respective CSVs. Raises with full context on failure rather than
+    silently skipping.
     """
-    set_full_determinism(seed)
+    if len(X_train) != len(y_train):
+        raise ValueError(
+            f"[{dataset_name}|{architecture}|seed {seed}] X_train has "
+            f"{len(X_train)} rows but y_train has {len(y_train)}. "
+            f"Data pipeline bug, stopping before training on misaligned data."
+        )
+    if len(X_test) != len(y_test):
+        raise ValueError(
+            f"[{dataset_name}|{architecture}|seed {seed}] X_test has "
+            f"{len(X_test)} rows but y_test has {len(y_test)}. "
+            f"Data pipeline bug, stopping before evaluating on misaligned data."
+        )
 
-    cat_to_idx = _category_to_index(categories)
-    y_train_idx = np.array([cat_to_idx[c] for c in y_train])
-    y_test_idx = np.array([cat_to_idx[c] for c in y_test])
+    try:
+        set_full_determinism(seed)
+        random.seed(seed)
+        np.random.seed(seed)
 
-    X_train_t = torch.tensor(X_train, dtype=torch.float32)
-    y_train_t = torch.tensor(y_train_idx, dtype=torch.long)
-    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
+        cat_to_idx = _category_to_index(categories)
+        y_train_idx = np.array([cat_to_idx[c] for c in y_train])
+        y_test_idx = np.array([cat_to_idx[c] for c in y_test])
 
-    train_dataset = TensorDataset(X_train_t, y_train_t)
-    # NOTE: generator is seeded too, so shuffling order is part of what
-    # varies (and is controlled) across seeds, matching Dodge et al.'s
-    # finding that data order is a distinct contributor to seed variance.
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    train_loader = DataLoader(
-        train_dataset, batch_size=config.DNN_BATCH_SIZE, shuffle=True,
-        generator=generator,
-    )
+        model = build_model(architecture, input_dim=X_train.shape[1], num_classes=len(categories))
 
-    model = IDSClassifier(
-        input_dim=X_train.shape[1], num_classes=len(categories)
-    ).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.DNN_LEARNING_RATE)
-    criterion = torch.nn.CrossEntropyLoss()
+        start_time = time.time()
+        model.fit(X_train, y_train_idx, seed)
+        train_time = time.time() - start_time
 
-    best_val_loss = float("inf")
-    patience_counter = 0
+        preds_idx = model.predict(X_test)
 
-    model.train()
-    start_time = time.time()
-    for epoch in range(config.DNN_EPOCHS):
-        epoch_loss = 0.0
-        for batch_X, batch_y in train_loader:
-            batch_X, batch_y = batch_X.to(DEVICE), batch_y.to(DEVICE)
-            optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * batch_X.size(0)
-        epoch_loss /= len(train_dataset)
+        idx_to_cat = {i: cat for cat, i in cat_to_idx.items()}
+        y_pred = np.array([idx_to_cat[i] for i in preds_idx])
 
-        # Simple early stopping on training loss plateau.
-        # (A held-out validation split can be added later if needed; kept
-        # simple here since the pilot's goal is the variance measurement,
-        # not squeezing out maximum accuracy.)
-        if epoch_loss < best_val_loss - 1e-5:
-            best_val_loss = epoch_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-        if patience_counter >= config.DNN_EARLY_STOP_PATIENCE:
-            break
+        aggregate_accuracy = float(np.mean(preds_idx == y_test_idx))
+        per_category = compute_per_category_metrics(y_test, y_pred, categories)
+        epochs_run = getattr(model, "epochs_run", None)
 
-    train_time = time.time() - start_time
+    except Exception as e:
+        raise RuntimeError(
+            f"Run FAILED at [{dataset_name} | {architecture} | seed {seed}]: "
+            f"{type(e).__name__}: {e}. Stopping here rather than silently "
+            f"skipping this seed, a missing seed in the results file would "
+            f"corrupt the variance analysis without any visible sign."
+        ) from e
 
-    # Evaluate
-    model.eval()
-    with torch.no_grad():
-        logits = model(X_test_t)
-        preds_idx = torch.argmax(logits, dim=1).cpu().numpy()
-
-    idx_to_cat = {i: cat for cat, i in cat_to_idx.items()}
-    y_pred = np.array([idx_to_cat[i] for i in preds_idx])
-
-    aggregate_accuracy = float(np.mean(preds_idx == y_test_idx))
-
-    per_category = compute_per_category_metrics(y_test, y_pred, categories)
-
-    # --- Append aggregate + per-category summary row ---
+    # --- Append summary row ---
     file_exists = os.path.exists(results_csv_path)
     with open(results_csv_path, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            header = ["seed", "aggregate_accuracy", "train_time_sec", "epochs_run"]
+            header = [
+                "schema_version", "dataset", "architecture", "seed",
+                "aggregate_accuracy", "train_time_sec", "epochs_run",
+            ]
             for cat in categories:
                 header += [f"{cat}_recall", f"{cat}_precision", f"{cat}_support"]
             writer.writerow(header)
-        row = [seed, aggregate_accuracy, round(train_time, 2), epoch + 1]
+        row = [
+            config.RESULTS_SCHEMA_VERSION, dataset_name, architecture, seed,
+            aggregate_accuracy, round(train_time, 2), epochs_run,
+        ]
         for cat in categories:
             row += [
                 per_category[cat]["recall"],
@@ -159,18 +127,25 @@ def train_one_seed(seed, X_train, y_train, X_test, y_test, categories,
             ]
         writer.writerow(row)
 
-    # --- Append per-instance predictions (needed for bootstrap resampling) ---
+    # --- Append per-instance predictions ---
     instance_file_exists = os.path.exists(per_instance_csv_path)
     with open(per_instance_csv_path, "a", newline="") as f:
         writer = csv.writer(f)
         if not instance_file_exists:
-            writer.writerow(["seed", "instance_id", "true_category", "pred_category", "correct"])
+            writer.writerow([
+                "schema_version", "dataset", "architecture", "seed",
+                "instance_id", "true_category", "pred_category", "correct",
+            ])
         for i in range(len(y_test)):
-            writer.writerow([seed, i, y_test[i], y_pred[i], int(y_test[i] == y_pred[i])])
+            writer.writerow([
+                config.RESULTS_SCHEMA_VERSION, dataset_name, architecture, seed, i,
+                y_test[i], y_pred[i], int(y_test[i] == y_pred[i]),
+            ])
 
     print(
-        f"[seed {seed}] done in {train_time:.1f}s, "
-        f"{epoch + 1} epochs, aggregate_accuracy={aggregate_accuracy:.4f}"
+        f"[{dataset_name} | {architecture} | seed {seed}] done in "
+        f"{train_time:.1f}s, epochs_run={epochs_run}, "
+        f"aggregate_accuracy={aggregate_accuracy:.4f}"
     )
 
     return aggregate_accuracy, per_category

@@ -4,6 +4,8 @@ data/*.txt
 data/*.csv
 results/*.csv
 checkpoints/*
+environment_logs/*.json
 !data/.gitkeep
 !results/.gitkeep
 !checkpoints/.gitkeep
+!environment_logs/.gitkeep
