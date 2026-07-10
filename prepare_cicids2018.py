@@ -4,18 +4,19 @@ One-time preparation script for CSE-CIC-IDS2018.
 Unlike NSL-KDD, this dataset does not ship as a single clean file with an
 official train/test split, it's distributed as multiple daily CSVs, with
 well-documented real-world messiness: inconsistent column name spacing
-(e.g. " Label" with a leading space), and Infinity/NaN values in
-Flow Bytes/s and Flow Packets/s from division-by-zero during feature
-extraction. This script handles all of that once and writes two clean,
-flat output files that data.py's loader can then read simply.
+(e.g. " Label" with a leading space), Infinity/NaN values in Flow Bytes/s
+and Flow Packets/s from division-by-zero during feature extraction, AND
+(confirmed via this project's actual downloaded data) inconsistent
+columns across daily files, one file has 4 extra columns (Src Port,
+Flow ID, Src IP, Dst IP) that no other file has. This script handles all
+of that and writes two clean, flat output files that data.py's loader
+can then read simply.
 
 DELIBERATE METHODOLOGICAL CHOICE, stated explicitly for the paper's
 Methods section: no SMOTE or other class-balancing is applied here,
 unlike the ACAFS paper's preprocessing. This study measures seed-driven
 instability under NATURAL class imbalance, consistent with how NSL-KDD
-is handled elsewhere in this codebase. Applying synthetic oversampling
-would introduce a different confound and make the two datasets
-inconsistent within the same paper.
+is handled elsewhere in this codebase.
 
 Usage:
     python prepare_cicids2018.py
@@ -32,11 +33,8 @@ RAW_DATA_DIR = os.path.join(config.DATA_DIR, "cicids2018_raw")
 OUTPUT_TRAIN_PATH = config.DATASETS["cse_cic_ids2018"]["train_path"]
 OUTPUT_TEST_PATH = config.DATASETS["cse_cic_ids2018"]["test_path"]
 
-# Columns known/suspected to be identifiers or leakage risks rather than
-# genuine traffic features. Matched case-insensitively, substring match
-# on the "ip" ones since exact column naming isn't confirmed yet.
 COLUMNS_TO_DROP_EXACT = {"timestamp", "flow id", "flow_id"}
-COLUMNS_TO_DROP_SUBSTRING = ["ip"]  # e.g. "Src IP", "Dst IP", "Source IP"
+COLUMNS_TO_DROP_SUBSTRING = ["ip"]
 
 
 def _clean_column_names(df):
@@ -74,23 +72,49 @@ def load_all_raw_files():
         df = _clean_column_names(df)
         frames.append(df)
 
+    # CRITICAL FIX, found via real data: CSE-CIC-IDS2018's daily files do
+    # not all have the same columns. One file (confirmed: the DDoS-LOIC-
+    # HTTP day) has 4 extra columns (Src Port, Flow ID, Src IP, Dst IP)
+    # that no other file has. Naively concatenating would silently fill
+    # those columns with NaN for every row from the other 9 files, and
+    # since dropna() later removes any row with ANY NaN feature, this
+    # wiped out 100% of every category except the two present in that
+    # one file. Restricting to the column INTERSECTION across all files
+    # before concatenating prevents this, rather than special-casing the
+    # one column discovered so far, this also protects against any other
+    # undiscovered inconsistency between files.
+    common_columns = set(frames[0].columns)
+    for df in frames[1:]:
+        common_columns &= set(df.columns)
+
+    all_columns = set()
+    for df in frames:
+        all_columns |= set(df.columns)
+    dropped_for_inconsistency = all_columns - common_columns
+    if dropped_for_inconsistency:
+        print(
+            f"WARNING: {len(dropped_for_inconsistency)} column(s) are not "
+            f"present in all {len(frames)} files and are being dropped "
+            f"entirely to avoid silent NaN-fill corruption during "
+            f"concatenation: {dropped_for_inconsistency}. This is a "
+            f"documented, disclosed data-quality issue with this "
+            f"dataset's daily files, worth stating explicitly in the "
+            f"paper's limitations section."
+        )
+
+    ordered_common_columns = [c for c in frames[0].columns if c in common_columns]
+    frames = [df[ordered_common_columns] for df in frames]
+
     combined = pd.concat(frames, ignore_index=True)
     print(f"Combined raw shape: {combined.shape}")
     return combined
 
 
 def check_label_mapping(df, attack_map):
-    """
-    Collects ALL unmapped label values before failing, rather than
-    erroring on the first one, since fixing one label at a time on a
-    multi-gigabyte, multi-file dataset with a slow reload cycle each time
-    would be a bad use of your time.
-    """
     if "Label" not in df.columns:
         raise ValueError(
             f"No 'Label' column found after cleaning. Columns present: "
-            f"{list(df.columns)}. This dataset's label column name may "
-            f"differ from expected, check the raw file's actual header."
+            f"{list(df.columns)}."
         )
 
     raw_labels = df["Label"].astype(str).str.strip().str.lower().unique()
@@ -100,9 +124,7 @@ def check_label_mapping(df, attack_map):
         raise ValueError(
             f"Found {len(unmapped)} label value(s) in the data with no "
             f"entry in config.CIC_IDS2018_ATTACK_MAP: {unmapped}\n"
-            f"Add these to the map in config.py before proceeding. Do not "
-            f"guess or silently drop them, an incomplete map would corrupt "
-            f"category-level results in a way that's hard to notice later."
+            f"Add these to the map in config.py before proceeding."
         )
 
     print(f"All {len(raw_labels)} unique raw label values map cleanly "
@@ -115,6 +137,23 @@ def clean_and_map(df, attack_map):
         print(f"Dropping identifier/leakage-risk columns: {columns_to_drop}")
         df = df.drop(columns=columns_to_drop)
 
+    if "Label" not in df.columns:
+        raise ValueError(
+            f"No 'Label' column found after cleaning. Columns present: "
+            f"{list(df.columns)}."
+        )
+
+    label_str = df["Label"].astype(str).str.strip()
+    embedded_header_mask = label_str.str.lower() == "label"
+    n_embedded_headers = int(embedded_header_mask.sum())
+    if n_embedded_headers > 0:
+        print(
+            f"Found and removed {n_embedded_headers} embedded duplicate "
+            f"header row(s) (literal 'Label' value appearing as data), "
+            f"a documented quirk of this dataset's file concatenation."
+        )
+        df = df[~embedded_header_mask].copy()
+
     check_label_mapping(df, attack_map)
 
     df["category"] = df["Label"].astype(str).str.strip().str.lower().map(attack_map)
@@ -122,10 +161,6 @@ def clean_and_map(df, attack_map):
 
     feature_cols = [c for c in df.columns if c != "category"]
 
-    # Known issue: Flow Bytes/s and Flow Packets/s can be Infinity from
-    # division by zero during feature extraction. Coerce to numeric,
-    # report and drop any resulting NaN/Inf rows rather than silently
-    # letting them corrupt training.
     for col in feature_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -135,8 +170,7 @@ def clean_and_map(df, attack_map):
     n_dropped = n_before - n_after
     print(
         f"Dropped {n_dropped} of {n_before} rows ({n_dropped/n_before*100:.2f}%) "
-        f"due to NaN/Inf values in feature columns (a documented, known "
-        f"issue in this dataset, not a bug in this script)."
+        f"due to NaN/Inf values in feature columns."
     )
 
     return df
@@ -144,11 +178,6 @@ def clean_and_map(df, attack_map):
 
 def stratified_split_and_subsample(df, categories, target_train_rows,
                                     target_test_rows, rng_seed):
-    """
-    Stratified train/test split (this dataset has no official split,
-    unlike NSL-KDD) followed by stratified subsampling to the target
-    sizes, preserving NATURAL class proportions throughout, no balancing.
-    """
     rng = np.random.default_rng(rng_seed)
 
     train_frames = []
@@ -176,10 +205,7 @@ def stratified_split_and_subsample(df, categories, target_train_rows,
             print(
                 f"WARNING: category '{cat}' has only {n_cat} rows available, "
                 f"fewer than the {cat_target_train + cat_target_test} "
-                f"requested (train+test). Using all {n_cat} available, "
-                f"split proportionally. This will make this category's "
-                f"final count smaller than planned, report the ACTUAL "
-                f"count, don't assume the target was hit."
+                f"requested (train+test). Using all {n_cat} available."
             )
             split_point = int(n_cat * (cat_target_train / (cat_target_train + cat_target_test)))
         else:
@@ -231,8 +257,7 @@ def main():
     print(
         "\nIMPORTANT: update config.py's 'expected_train_rows' and "
         "'expected_test_rows' for cse_cic_ids2018 with the exact numbers "
-        "printed above, so data.py's row-count validation actually checks "
-        "against a real, confirmed number instead of None."
+        "printed above."
     )
 
 

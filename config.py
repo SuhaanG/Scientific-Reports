@@ -114,8 +114,8 @@ DATASETS = {
         # files and reports real row counts, data.py treats None as
         # "skip the exact row-count check" rather than silently assuming
         # a number that hasn't been confirmed.
-        "expected_train_rows": None,
-        "expected_test_rows": None,
+        "expected_train_rows": 200000,
+        "expected_test_rows": 39999,
     },
 }
 

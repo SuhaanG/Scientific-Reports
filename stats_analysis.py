@@ -164,6 +164,21 @@ def true_variance_decomposition(summary_df, per_instance_df, category,
     mean_within_seed_variance = np.mean(within_seed_variances) if within_seed_variances else 0.0
     genuine_between_seed_variance = max(0.0, observed_variance - mean_within_seed_variance)
 
+    # FIX: distinguish a genuinely strong signal (real variance, near-zero
+    # noise) from a degenerate case (zero variance AND zero noise, e.g. a
+    # category where every single seed produced the exact same result,
+    # such as a model that never learns an ultra-rare class at all).
+    # Both previously reported signal_to_noise_ratio=inf, which misleadingly
+    # reads as "extremely strong effect" for what is actually "nothing
+    # happened, there's no variability to explain at all."
+    is_degenerate = observed_variance < 1e-12 and mean_within_seed_variance < 1e-12
+    if is_degenerate:
+        signal_to_noise = None
+    elif mean_within_seed_variance > 0:
+        signal_to_noise = genuine_between_seed_variance / mean_within_seed_variance
+    else:
+        signal_to_noise = float("inf")
+
     return {
         "category": category,
         "n_seeds": len(point_estimates),
@@ -172,10 +187,8 @@ def true_variance_decomposition(summary_df, per_instance_df, category,
         "mean_within_seed_sampling_variance": mean_within_seed_variance,
         "genuine_between_seed_variance": genuine_between_seed_variance,
         "genuine_between_seed_std": np.sqrt(genuine_between_seed_variance),
-        "signal_to_noise_ratio": (
-            genuine_between_seed_variance / mean_within_seed_variance
-            if mean_within_seed_variance > 0 else float("inf")
-        ),
+        "signal_to_noise_ratio": signal_to_noise,
+        "is_degenerate_zero_variance": is_degenerate,
     }
 
 
@@ -268,7 +281,14 @@ def _check_minimum_seeds(subset, dataset, architecture, minimum=2):
 
 def run_full_analysis(results_csv_path, per_instance_csv_path,
                        dataset="nsl_kdd", architecture="dnn", categories=None):
-    categories = categories or config.ATTACK_CATEGORIES
+    if categories is None:
+        if dataset not in config.DATASETS:
+            raise ValueError(
+                f"'{dataset}' is not in config.DATASETS, cannot infer its "
+                f"categories. Either register it there or pass "
+                f"categories= explicitly."
+            )
+        categories = config.DATASETS[dataset]["categories"]
     summary_df = load_results(results_csv_path)
     per_instance_df = load_per_instance(per_instance_csv_path)
 
@@ -302,10 +322,14 @@ def run_full_analysis(results_csv_path, per_instance_csv_path,
     print("\n--- True bootstrap variance decomposition ---")
     for cat in categories:
         d = true_variance_decomposition(summary_df, per_instance_df, cat, dataset, architecture)
+        if d["is_degenerate_zero_variance"]:
+            snr_str = "N/A (degenerate: zero variance in both observed and sampling noise, e.g. identical result every seed)"
+        else:
+            snr_str = f"{d['signal_to_noise_ratio']:.2f}"
         print(f"{cat}: observed_var={d['observed_variance_of_point_estimates']:.6f}  "
               f"sampling_noise_var={d['mean_within_seed_sampling_variance']:.6f}  "
               f"genuine_var={d['genuine_between_seed_variance']:.6f}  "
-              f"signal_to_noise={d['signal_to_noise_ratio']:.2f}")
+              f"signal_to_noise={snr_str}")
 
     print("\n--- Seed adequacy ---")
     print(seed_adequacy_analysis(summary_df, dataset, architecture, "aggregate_accuracy"))
