@@ -1,6 +1,6 @@
 """
 Data loading and preprocessing, generalized across the dataset registry
-in config.py. NSL-KDD and CSE-CIC-IDS2018 are both implemented.
+in config.py. NSL-KDD, CSE-CIC-IDS2018, and UNSW-NB15 are all implemented.
 """
 
 import os
@@ -245,10 +245,13 @@ def _load_and_preprocess_cic_ids2018(ds_config):
 
     # Independently re-verify all feature columns are actually numeric,
     # rather than trusting prepare_cicids2018.py did this correctly.
-    # This file is a standalone safety layer, not a passthrough.
+    # This file is a standalone safety layer, not a passthrough. Uses
+    # pd.api.types.is_numeric_dtype rather than np.issubdtype, since the
+    # latter cannot interpret pandas' newer StringDtype backend and
+    # raises a TypeError on it, caught via testing under pandas 3.x.
     non_numeric_cols = [
         c for c in train_features.columns
-        if not np.issubdtype(train_features[c].dtype, np.number)
+        if not pd.api.types.is_numeric_dtype(train_features[c])
     ]
     if non_numeric_cols:
         raise ValueError(
@@ -274,12 +277,134 @@ def _load_and_preprocess_cic_ids2018(ds_config):
 
 
 # ---------------------------------------------------------------------------
+# UNSW-NB15 loader
+# ---------------------------------------------------------------------------
+
+def _load_unsw_nb15_raw(path, expected_rows):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Could not find {path}. Download the official pre-partitioned "
+            f"UNSW-NB15 train/test CSVs and place them there before running "
+            f"anything."
+        )
+    df = pd.read_csv(path)
+    _validate_row_count(df, expected_rows, path)
+    return df
+
+
+def _load_and_preprocess_unsw_nb15(ds_config):
+    train_df = _load_unsw_nb15_raw(ds_config["train_path"], ds_config["expected_train_rows"])
+    test_df = _load_unsw_nb15_raw(ds_config["test_path"], ds_config["expected_test_rows"])
+
+    expected_categories = ds_config["categories"]
+
+    # Column names are matched case-insensitively since we have not yet
+    # verified the exact real header from a downloaded file; adjust here
+    # if the actual file uses different capitalization or spacing.
+    def _find_column(df, target_name):
+        matches = [c for c in df.columns if c.strip().lower() == target_name]
+        return matches[0] if matches else None
+
+    for df, df_name in [(train_df, "train"), (test_df, "test")]:
+        cat_col = _find_column(df, "attack_cat")
+        if cat_col is None:
+            raise ValueError(
+                f"No 'attack_cat' column found in the UNSW-NB15 {df_name} "
+                f"file. Columns present: {list(df.columns)}. This dataset's "
+                f"category column may be named differently than expected, "
+                f"check the actual downloaded file's header before "
+                f"proceeding."
+            )
+
+    train_cat_col = _find_column(train_df, "attack_cat")
+    test_cat_col = _find_column(test_df, "attack_cat")
+
+    train_df["category"] = train_df[train_cat_col].astype(str).str.strip().str.lower()
+    test_df["category"] = test_df[test_cat_col].astype(str).str.strip().str.lower()
+
+    y_train = train_df["category"].values
+    y_test = test_df["category"].values
+
+    _check_category_completeness(
+        y_train, y_test, expected_categories,
+        (ds_config["train_path"], ds_config["test_path"]),
+    )
+
+    # Drop the id (row identifier), attack_cat (now captured as 'category'),
+    # and label (binary attack/normal flag) columns. 'label' is dropped
+    # deliberately: it is a direct, trivial function of attack_cat
+    # (1 iff attack_cat != normal) and would leak the answer if kept as a
+    # feature, this is a real leakage risk, not a hypothetical one.
+    id_col_train = _find_column(train_df, "id")
+    label_col_train = _find_column(train_df, "label")
+    id_col_test = _find_column(test_df, "id")
+    label_col_test = _find_column(test_df, "label")
+
+    drop_cols_train = [c for c in [id_col_train, train_cat_col, label_col_train, "category"] if c]
+    drop_cols_test = [c for c in [id_col_test, test_cat_col, label_col_test, "category"] if c]
+
+    train_features = train_df.drop(columns=drop_cols_train)
+    test_features = test_df.drop(columns=drop_cols_test)
+
+    if not set(train_features.columns) == set(test_features.columns):
+        raise ValueError(
+            f"Train and test feature columns don't match after dropping "
+            f"id/attack_cat/label. Train has "
+            f"{set(train_features.columns) - set(test_features.columns)} "
+            f"extra, test has "
+            f"{set(test_features.columns) - set(train_features.columns)} "
+            f"extra. Do not proceed with mismatched columns."
+        )
+    test_features = test_features[train_features.columns]
+
+    _audit_train_test_overlap(train_features, test_features)
+
+    # Dynamically detect categorical columns (proto, service, state in the
+    # documented schema) rather than hardcoding their names, defensive
+    # against minor naming differences in the actual downloaded file.
+    categorical_cols = [
+        c for c in train_features.columns
+        if not pd.api.types.is_numeric_dtype(train_features[c])
+    ]
+    numeric_cols = [c for c in train_features.columns if c not in categorical_cols]
+
+    if categorical_cols:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+        encoder.fit(train_features[categorical_cols])
+        train_cat_encoded = encoder.transform(train_features[categorical_cols])
+        test_cat_encoded = encoder.transform(test_features[categorical_cols])
+        cat_feature_names = list(encoder.get_feature_names_out(categorical_cols))
+    else:
+        train_cat_encoded = np.empty((len(train_features), 0))
+        test_cat_encoded = np.empty((len(test_features), 0))
+        cat_feature_names = []
+
+    train_numeric = train_features[numeric_cols].values.astype(np.float64)
+    test_numeric = test_features[numeric_cols].values.astype(np.float64)
+
+    scaler = StandardScaler()
+    train_numeric_scaled = scaler.fit_transform(train_numeric)
+    test_numeric_scaled = scaler.transform(test_numeric)
+
+    X_train = np.concatenate([train_numeric_scaled, train_cat_encoded], axis=1)
+    X_test = np.concatenate([test_numeric_scaled, test_cat_encoded], axis=1)
+
+    _check_no_nan_or_inf(X_train, "X_train")
+    _check_no_nan_or_inf(X_test, "X_test")
+
+    feature_names = numeric_cols + cat_feature_names
+
+    return X_train, y_train, X_test, y_test, feature_names
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
 _LOADERS = {
     "nsl_kdd": _load_and_preprocess_nsl_kdd,
     "cse_cic_ids2018": _load_and_preprocess_cic_ids2018,
+    "unsw_nb15": _load_and_preprocess_unsw_nb15,
 }
 
 
