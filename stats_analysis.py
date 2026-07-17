@@ -12,9 +12,14 @@ Implements:
    clipped at zero.
 
    VALIDATED against synthetic data with a KNOWN ground-truth between-seed
-   variance before being trusted on real results, not just checked for
-   plausible output. (1.6% relative bias when a real effect exists;
-   correctly near-zero, 0.0000046 vs true 0, in the null case.)
+   variance (see validate_bootstrap_decomposition.py) before being trusted
+   on real results, not just checked for plausible output.
+
+   Supports decomposing AGGREGATE accuracy (category=None) as well as
+   per-category recall, added after real data (LightGBM on NSL-KDD)
+   showed aggregate accuracy itself can be genuinely unstable, not just
+   per-category recall, which was previously assumed to always be stable
+   enough not to need this treatment.
 
 2. Clopper-Pearson exact intervals for small classes.
 
@@ -26,9 +31,8 @@ Implements:
 5. Seed-count adequacy analysis: CI width as a function of seed count.
 
 6. Cross-architecture comparison: is genuine between-seed variance for a
-   given category similar across DNN / Random Forest / XGBoost, or is
-   instability specific to one architecture family? This directly serves
-   the project's architecture-generality research question.
+   given category similar across architectures, or is instability
+   specific to one architecture family?
 
 Run this AFTER a training run (pilot or full-scale) has produced the
 results CSV files.
@@ -57,14 +61,6 @@ def load_per_instance(per_instance_csv_path):
 
 
 def _check_no_duplicate_runs(df, path):
-    """
-    Catches silently double-counted seeds. This happens easily in
-    practice: crash-safe incremental CSV writing means a partially
-    completed run followed by a restart (without clearing old output)
-    appends duplicate (dataset, architecture, seed) rows, silently
-    corrupting the variance calculation by over-weighting whichever
-    seeds happened to run twice.
-    """
     key_cols = ["dataset", "architecture", "seed"]
     if not all(c in df.columns for c in key_cols):
         return
@@ -108,17 +104,24 @@ def clopper_pearson_interval(successes, n, confidence=None):
 
 def _bootstrap_within_seed_variance(per_instance_df, filters, category,
                                      n_bootstrap=None, rng=None):
+    """
+    category=None means aggregate accuracy: bootstrap over ALL instances
+    for this seed, regardless of true_category, rather than filtering to
+    one category's instances.
+    """
     n_bootstrap = n_bootstrap or config.BOOTSTRAP_ITERATIONS
     rng = rng or np.random.default_rng(config.BOOTSTRAP_RNG_SEED)
 
     df = per_instance_df
     for col, val in filters.items():
         df = df[df[col] == val]
-    cat_df = df[df["true_category"] == category]
-    if len(cat_df) == 0:
+
+    if category is not None:
+        df = df[df["true_category"] == category]
+    if len(df) == 0:
         return None
 
-    correct = cat_df["correct"].values
+    correct = df["correct"].values
     n = len(correct)
 
     boot_recalls = np.empty(n_bootstrap)
@@ -140,11 +143,14 @@ def true_variance_decomposition(summary_df, per_instance_df, category,
     Decomposes observed variance across seeds into genuine between-seed
     variance and within-seed sampling noise, using real bootstrap
     resampling (not a formula approximation) for the noise component.
+
+    category=None decomposes AGGREGATE accuracy instead of a specific
+    category's recall.
     """
     subset = summary_df[
         (summary_df["dataset"] == dataset) & (summary_df["architecture"] == architecture)
     ]
-    metric_col = f"{category}_recall"
+    metric_col = "aggregate_accuracy" if category is None else f"{category}_recall"
     point_estimates = subset[metric_col].dropna().values
     seeds = subset["seed"].values
 
@@ -164,13 +170,6 @@ def true_variance_decomposition(summary_df, per_instance_df, category,
     mean_within_seed_variance = np.mean(within_seed_variances) if within_seed_variances else 0.0
     genuine_between_seed_variance = max(0.0, observed_variance - mean_within_seed_variance)
 
-    # FIX: distinguish a genuinely strong signal (real variance, near-zero
-    # noise) from a degenerate case (zero variance AND zero noise, e.g. a
-    # category where every single seed produced the exact same result,
-    # such as a model that never learns an ultra-rare class at all).
-    # Both previously reported signal_to_noise_ratio=inf, which misleadingly
-    # reads as "extremely strong effect" for what is actually "nothing
-    # happened, there's no variability to explain at all."
     is_degenerate = observed_variance < 1e-12 and mean_within_seed_variance < 1e-12
     if is_degenerate:
         signal_to_noise = None
@@ -180,7 +179,7 @@ def true_variance_decomposition(summary_df, per_instance_df, category,
         signal_to_noise = float("inf")
 
     return {
-        "category": category,
+        "category": "aggregate_accuracy" if category is None else category,
         "n_seeds": len(point_estimates),
         "mean_point_estimate": np.mean(point_estimates),
         "observed_variance_of_point_estimates": observed_variance,
@@ -193,14 +192,6 @@ def true_variance_decomposition(summary_df, per_instance_df, category,
 
 
 def compare_architectures(summary_df, per_instance_df, category, dataset, architectures):
-    """
-    Compares genuine between-seed variance for `category` ACROSS
-    architectures, directly answering "is this instability specific to
-    one architecture family, or general." Returns one row per architecture
-    plus a relative-magnitude comparison against the smallest observed
-    value, so it's immediately clear whether architectures differ by a
-    little or by orders of magnitude.
-    """
     rows = []
     for arch in architectures:
         decomp = true_variance_decomposition(summary_df, per_instance_df, category, dataset, arch)
@@ -320,6 +311,15 @@ def run_full_analysis(results_csv_path, per_instance_csv_path,
               f"effect_size={r['std_ratio_effect_size']:.2f}  {marker}")
 
     print("\n--- True bootstrap variance decomposition ---")
+    d_agg = true_variance_decomposition(summary_df, per_instance_df, None, dataset, architecture)
+    if d_agg["is_degenerate_zero_variance"]:
+        snr_str_agg = "N/A (degenerate)"
+    else:
+        snr_str_agg = f"{d_agg['signal_to_noise_ratio']:.2f}"
+    print(f"aggregate_accuracy: observed_var={d_agg['observed_variance_of_point_estimates']:.6f}  "
+          f"sampling_noise_var={d_agg['mean_within_seed_sampling_variance']:.6f}  "
+          f"genuine_var={d_agg['genuine_between_seed_variance']:.6f}  "
+          f"signal_to_noise={snr_str_agg}")
     for cat in categories:
         d = true_variance_decomposition(summary_df, per_instance_df, cat, dataset, architecture)
         if d["is_degenerate_zero_variance"]:

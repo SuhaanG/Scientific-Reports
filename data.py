@@ -239,16 +239,10 @@ def _load_and_preprocess_cic_ids2018(ds_config):
             f"extra. This means prepare_cicids2018.py produced "
             f"inconsistent files, do not proceed."
         )
-    test_features = test_features[train_features.columns]  # enforce same order
+    test_features = test_features[train_features.columns]
 
     _audit_train_test_overlap(train_features, test_features)
 
-    # Independently re-verify all feature columns are actually numeric,
-    # rather than trusting prepare_cicids2018.py did this correctly.
-    # This file is a standalone safety layer, not a passthrough. Uses
-    # pd.api.types.is_numeric_dtype rather than np.issubdtype, since the
-    # latter cannot interpret pandas' newer StringDtype backend and
-    # raises a TypeError on it, caught via testing under pandas 3.x.
     non_numeric_cols = [
         c for c in train_features.columns
         if not pd.api.types.is_numeric_dtype(train_features[c])
@@ -298,9 +292,6 @@ def _load_and_preprocess_unsw_nb15(ds_config):
 
     expected_categories = ds_config["categories"]
 
-    # Column names are matched case-insensitively since we have not yet
-    # verified the exact real header from a downloaded file; adjust here
-    # if the actual file uses different capitalization or spacing.
     def _find_column(df, target_name):
         matches = [c for c in df.columns if c.strip().lower() == target_name]
         return matches[0] if matches else None
@@ -330,11 +321,6 @@ def _load_and_preprocess_unsw_nb15(ds_config):
         (ds_config["train_path"], ds_config["test_path"]),
     )
 
-    # Drop the id (row identifier), attack_cat (now captured as 'category'),
-    # and label (binary attack/normal flag) columns. 'label' is dropped
-    # deliberately: it is a direct, trivial function of attack_cat
-    # (1 iff attack_cat != normal) and would leak the answer if kept as a
-    # feature, this is a real leakage risk, not a hypothetical one.
     id_col_train = _find_column(train_df, "id")
     label_col_train = _find_column(train_df, "label")
     id_col_test = _find_column(test_df, "id")
@@ -359,9 +345,6 @@ def _load_and_preprocess_unsw_nb15(ds_config):
 
     _audit_train_test_overlap(train_features, test_features)
 
-    # Dynamically detect categorical columns (proto, service, state in the
-    # documented schema) rather than hardcoding their names, defensive
-    # against minor naming differences in the actual downloaded file.
     categorical_cols = [
         c for c in train_features.columns
         if not pd.api.types.is_numeric_dtype(train_features[c])

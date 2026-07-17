@@ -98,10 +98,6 @@ class IDSClassifierDNN:
 
         n = len(X_train)
         n_val = int(n * config.DNN_VALIDATION_FRACTION)
-        # Validation split uses a FIXED reference seed, deliberately NOT the
-        # training seed, so every seed is compared on the identical
-        # train/validation partition. Only weight init and minibatch
-        # shuffling order vary across seeds; the split itself is constant.
         split_rng = np.random.default_rng(config.RANDOM_STATE_FOR_SPLIT)
         perm = split_rng.permutation(n)
         val_idx = perm[:n_val]
@@ -186,11 +182,11 @@ class RandomForestModel:
         self.epochs_run = None
 
     def fit(self, X_train, y_train_idx, seed):
-        self.model = LogisticRegression(
-            solver=config.LOGREG_SOLVER,
-            max_iter=config.LOGREG_MAX_ITER,
-            C=config.LOGREG_C,
+        self.model = RandomForestClassifier(
+            n_estimators=config.RF_N_ESTIMATORS,
+            max_depth=config.RF_MAX_DEPTH,
             random_state=seed,
+            n_jobs=-1,
         )
         self.model.fit(X_train, y_train_idx)
         self.epochs_run = None
@@ -293,7 +289,6 @@ class LogisticRegressionModel:
             max_iter=config.LOGREG_MAX_ITER,
             C=config.LOGREG_C,
             random_state=seed,
-            n_jobs=-1,
         )
         self.model.fit(X_train, y_train_idx)
         self.epochs_run = None
